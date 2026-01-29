@@ -59,7 +59,7 @@ class DatasetManager:
         """
         Load the task descriptions.
         """
-        path = f'/home/ycheng/.cache/relbench/{database_name}/task_description/task_description.json'
+        path = ''
         with open(path, "r") as f:
             task_data = json.load(f)
             for task_type, task_dict in task_data.items():
