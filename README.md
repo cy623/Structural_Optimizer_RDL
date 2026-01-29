@@ -21,5 +21,11 @@ Get datasets：
 ```
 python dataset.py
 ```
-For the full details about RelBench: https://github.com/snap-stanford/relbench/tree/main
+For the full details about RelBench: [RelBench](https://github.com/snap-stanford/relbench/tree/main)
 
+Run pipeline
+--------
+1. You can run our model by the script:
+```
+python main.py
+```
