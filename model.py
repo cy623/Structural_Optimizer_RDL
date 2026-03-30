@@ -863,21 +863,44 @@ class StructuralInjectionManager(nn.Module):
         return torch.stack([src, dst])
     
     def _generate_temporal_edges(self, template, x_dict, batch):
+        """生成时间连续性边"""
         node_type = template['node_type']
         k = template['k']
-        
+
         if node_type not in x_dict:
             return None
-            
+
         n_nodes = x_dict[node_type].size(0)
         if n_nodes < 2:
             return None
-        
-        device = x_dict[node_type].device 
 
-        src = torch.arange(n_nodes - 1, device=device)
-        dst = torch.arange(1, n_nodes, device=device)
-        
+        device = x_dict[node_type].device
+
+        src_list, dst_list = [], []
+
+        # 按entity分组，组内按时间排序后连接
+        if hasattr(batch[node_type], 'batch') and hasattr(batch, 'time_dict') and node_type in batch.time_dict:
+            entity_ids = batch[node_type].batch          # 每个节点属于哪个seed entity
+            timestamps = batch.time_dict[node_type]      # 每个节点的时间戳
+
+            for eid in entity_ids.unique():
+                mask = (entity_ids == eid).nonzero(as_tuple=True)[0]
+                if mask.size(0) < 2:
+                    continue
+                # 按时间排序
+                order = timestamps[mask].argsort()
+                sorted_idx = mask[order]
+                src_list.append(sorted_idx[:-1])
+                dst_list.append(sorted_idx[1:])
+
+        # fallback：如果batch信息不可用，退回简化版
+        if len(src_list) == 0:
+            src = torch.arange(n_nodes - 1, device=device)
+            dst = torch.arange(1, n_nodes, device=device)
+            return torch.stack([src, dst])
+
+        src = torch.cat(src_list).to(device)
+        dst = torch.cat(dst_list).to(device)
         return torch.stack([src, dst])
     
     def _get_edge_key_for_template(self, template):
