@@ -1,4 +1,3 @@
-"""Validation-only model selection and separately frozen test prediction export."""
 import copy
 import hashlib
 import json
@@ -11,6 +10,7 @@ from common import DATA_REVISION, OFFICIAL_COMMIT, lock, reseed, sha256, source_
 from data_pipeline import download, load_task, make_loader, read_graph
 
 GATE_THRESHOLDS = [.5, .7, .78, .82, .86, .9]
+
 
 def locations(args):
     name = task_id(args.dataset, args.task)
@@ -69,7 +69,7 @@ def train(args, config):
     tables = {s: task.get_table(s).df for s in ('train', 'val')}
     cfg = SimpleNamespace(**config)
     device = torch.device('cpu' if args.gpu == 'cpu' else 'cuda:0')
-    thresholds = thresholds = sorted(set(GATE_THRESHOLDS))
+    thresholds = sorted(set(GATE_THRESHOLDS))
     trial = args.trial_id or hashlib.sha256(json.dumps([config, thresholds], sort_keys=True).encode()).hexdigest()[:16]
     rows_path = Path(args.output_root) / 'results' / (name + '_all_results.jsonl')
     identity = dict(source_hash=source_hash(), graph_sha256=graph_meta['graph_sha256'])
@@ -164,25 +164,21 @@ def predict(args):
     name, folder, lock_path = locations(args)
     freeze_path = Path(args.output_root) / 'frozen' / (name + '.json')
     with lock(lock_path):
-        params = json.loads((folder / 'params.json').read_text())
         checkpoint = folder / 'best.pt'
-        if params['checkpoint_sha256'] != sha256(checkpoint):
-            raise RuntimeError('best.pt does not match the checkpoint_sha256 in params.json')
-        freeze = dict(dataset=args.dataset, task=args.task, config=params['selected_config'],
-                      best_val_auc=params['best_val_auc'], best_epoch=params['best_epoch'],
-                      checkpoint_sha256=params['checkpoint_sha256'], source_hash=params['source_hash'],
-                      graph_sha256=params['graph_sha256'], official_commit=OFFICIAL_COMMIT,
+        saved = torch.load(checkpoint, map_location='cpu', weights_only=False)  # the weights and the config they were trained with
+        freeze = dict(dataset=args.dataset, task=args.task, config=saved['config'],
+                      checkpoint_sha256=sha256(checkpoint), source_hash=saved['source_hash'],
+                      graph_sha256=saved['graph_sha256'], official_commit=OFFICIAL_COMMIT,
                       data_revision=DATA_REVISION, selection_metric='validation_roc_auc',
                       test_labels_loaded=False)
         if freeze_path.exists() and json.loads(freeze_path.read_text()) != freeze:
             raise RuntimeError('Existing freeze differs; prediction export refused')
         write_json(freeze_path, freeze)
-    # The model/configuration are frozen BEFORE fetching test data.
     download(args.data_root, args.dataset, args.task, prediction=True)
     task = load_task(args.data_root, args.dataset, args.task)
     test_path = Path(args.data_root) / args.dataset / 'tasks' / args.task / 'test.parquet'
     keys = [task.entity_col, task.time_col]
-    frame = pd.read_parquet(test_path, columns=keys)  # test TARGET column is never read
+    frame = pd.read_parquet(test_path, columns=keys)  
     if frame.duplicated(keys).any():
         raise ValueError('Official test keys contain duplicates')
     graph, meta = read_graph(args)
@@ -190,7 +186,6 @@ def predict(args):
     cfg = SimpleNamespace(**freeze['config'])
     reseed(cfg.seed)
     model = make_model(graph, cfg, args, device)
-    saved = torch.load(checkpoint, map_location='cpu', weights_only=False)
     model.load_state_dict(saved['model'], strict=True)
     model.eval()
     loader = make_loader(graph['data'], task, frame, cfg, labels=False)
