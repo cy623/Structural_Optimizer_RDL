@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.venv/
+data/raw/
+data/graph/*__*/
+data/graph_categorical/
+outputs*/
