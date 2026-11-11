@@ -1,925 +1,322 @@
-from typing import List, Optional, Dict, Any, Tuple
-from torch import Tensor
-import torch
-from torch_geometric.data import HeteroData
-from torch_geometric.nn import MLP
-from torch_geometric.typing import NodeType
-from torch_frame.data.stats import StatType
-from encoders import HeteroEncoder, HeteroTemporalEncoder, HeteroGraphSAGE
-from torch.nn import Embedding, ModuleDict
-from relgnn import RelGNN
-import torch.nn as nn
-from gates import StructureGate
-from collections.abc import Mapping
 import math
-from copy import deepcopy
+import datetime
+import fcntl
+import hashlib
+import json
+import os
+import random
+import time
+from pathlib import Path
+from dataclasses import asdict, dataclass
+from types import SimpleNamespace
+from typing import Optional
+import numpy as np
+import torch
+from torch import Tensor, nn
+import torch.nn.functional as F
+from torch_geometric.nn import LayerNorm, MLP, SAGEConv as PyGSAGEConv
+from torch_scatter import segment_csr
+from encoders import HeteroEncoder, HeteroTemporalEncoder
 
 
-class L0Gate(nn.Module):
-    def __init__(self, n, init_logit=2.0, tau=2.0, gamma=-0.1, zeta=1.1, eps=1e-6):
-        super().__init__()
-        self.logit = nn.Parameter(torch.full((n,), float(init_logit)))
-        self.tau = float(tau)
-        self.gamma, self.zeta = float(gamma), float(zeta)
-        self.eps = float(eps)
-        self.n = n 
 
-    def set_tau(self, tau: float):
-        self.tau = float(max(tau, 1e-3))  
+class DeterministicSAGEConv(PyGSAGEConv):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        if self.aggr != 'sum':
+            raise ValueError('DeterministicSAGEConv implements the configured sum aggregation only')
 
-    def forward(self):
-        if self.training:
-            u = torch.rand_like(self.logit)
-            u = u.clamp(self.eps, 1.0 - self.eps)
-            s = torch.sigmoid((torch.log(u) - torch.log(1 - u) + self.logit) / self.tau)
+    def forward(self, x, edge_index, size=None):
+        if not isinstance(edge_index, Tensor):
+            raise TypeError('This implementation expects the experiment\'s COO edge_index tensor')
+        order = torch.argsort(edge_index[1], stable=True)
+        sorted_edges = edge_index[:, order]
+        return super().forward(x, sorted_edges, size)
+
+    def aggregate(self, inputs: Tensor, index: Tensor, ptr: Optional[Tensor] = None,
+                  dim_size: Optional[int] = None) -> Tensor:
+        assert inputs.dim() == 2
+        if ptr is None:
+            if dim_size is None:
+                dim_size = int(index.max()) + 1 if index.numel() else 0
+            counts = torch.bincount(index, minlength=dim_size)
+            ptr = torch.cat([counts.new_zeros(1), counts.cumsum(0)])
+        return segment_csr(inputs, ptr, reduce='sum')
+
+
+
+SAGEConv = DeterministicSAGEConv
+
+
+@dataclass(frozen=True)
+class Template:
+    kind: str
+    src: str
+    dst: str
+    route: tuple = ()
+
+
+def template_catalog(node_types, edge_types, temporal_fields, strategies):
+    if strategies == 'none': return []
+    enabled = set(strategies.split(','))
+    if enabled == {'all'}: enabled = {'knn','two_hop','behavioral','temporal'}
+    if not enabled <= {'knn','two_hop','behavioral','temporal'}:
+        raise ValueError('Unknown strategy; use knn,two_hop,behavioral,temporal or all')
+    templates = []
+    if 'knn' in enabled:
+        templates += [Template('knn',nt,nt) for nt in node_types]
+    if 'two_hop' in enabled:
+        templates += [Template('two_hop',a[0],b[2],(a,b)) for a in edge_types for b in edge_types if a[2]==b[0]]
+    if 'behavioral' in enabled:
+        templates += [Template('behavioral',e[0],e[0],(e,)) for e in edge_types]
+    if 'temporal' in enabled:
+        templates += [Template('temporal',nt,nt,(field,)) for nt in node_types for field in temporal_fields.get(nt,[])]
+    return templates
+
+
+def empty(device):
+    return torch.empty((2,0),dtype=torch.long,device=device)
+
+
+@torch.no_grad()
+def similarity_edges(x, groups, k=None, threshold=None, eligible=None, budget=1<<24):
+
+    x=F.normalize(x.detach(),dim=-1);device=x.device
+    allowed=torch.ones(len(groups),dtype=torch.bool,device=device) if eligible is None else eligible.to(device)
+    order=allowed.nonzero().flatten();order=order[torch.sort(groups[order],stable=True).indices]
+    _,sizes=torch.unique_consecutive(groups[order],return_counts=True);starts=sizes.cumsum(0)-sizes
+    keep=(sizes>=2).nonzero().flatten()
+    if not keep.numel():return empty(device)
+    keep=keep[torch.sort(sizes[keep],descending=True,stable=True).indices]  # similar sizes share a block
+    sizes,starts=sizes[keep],starts[keep];sizes_list=sizes.tolist()
+    keys=[];edges=[];i=0
+    while i<len(keep):
+        n=sizes_list[i];count=max(1,budget//(n*n));sz,st=sizes[i:i+count],starts[i:i+count];i+=count
+        slot=torch.arange(n,device=device);valid=slot[None,:]<sz[:,None]
+        pos=torch.where(valid,st[:,None]+slot[None,:],0);node=order[pos];feats=x[node]*valid[...,None]
+        rows=max(256,budget//(n*len(sz)))
+        for r0 in range(0,n,rows):
+            r1=min(r0+rows,n);scores=feats[:,r0:r1]@feats.transpose(1,2)
+            scores.masked_fill_(~valid[:,None,:],-torch.inf)
+            scores[:,torch.arange(r1-r0,device=device),torch.arange(r0,r1,device=device)]=-torch.inf
+            query_ok=valid[:,r0:r1]
+            if k is not None:
+                width=min(k,n-1);top=scores.topk(width,dim=2).indices;rank=torch.arange(width,device=device)
+                ok=query_ok[...,None]&(rank[None,None,:]<(sz-1).clamp(max=k)[:,None,None])
+                g,q,r=ok.nonzero(as_tuple=True);src=node[g,top[g,q,r]]
+                keys.append(pos[g,r0+q]*k+r)
+            else:
+                g,q,c=((scores>threshold)&query_ok[...,None]).nonzero(as_tuple=True);src=node[g,c]
+                keys.append(pos[g,r0+q]*len(order)+pos[g,c])
+            edges.append(torch.stack([src,node[g,r0+q]]))
+    edges=torch.cat(edges,dim=1)
+    return edges[:,torch.argsort(torch.cat(keys))] if edges.numel() else empty(device)
+
+
+def compose_edges(first,second,shape,budget=1<<25):
+    """Exact Boolean two-hop join; no truncation or random edge cap. Unique edges sorted by (row, col)."""
+    a,b,c=shape;device=first.device
+    if not first.shape[1] or not second.shape[1]:return empty(device)
+    mid,perm=torch.sort(second[0],stable=True);far=second[1][perm]
+    lo=torch.searchsorted(mid,first[1]);count=torch.searchsorted(mid,first[1],right=True)-lo
+    total=count.cumsum(0);last=int(total[-1])  # join in blocks of about `budget` pairs before de-duplication
+    cuts=[0]+(torch.searchsorted(total,torch.arange(budget,last,budget,device=device),right=True).tolist()
+              if last>budget else [])+[len(count)]
+    keys=[]
+    for s,e in zip(cuts[:-1],cuts[1:]):
+        if s>=e:continue
+        n=count[s:e];rep=torch.repeat_interleave(n)
+        within=torch.arange(len(rep),device=device)-torch.repeat_interleave(n.cumsum(0)-n,n)
+        keys.append(torch.unique(first[0][s:e][rep]*c+far[lo[s:e][rep]+within]))
+    key=torch.unique(torch.cat(keys))
+    return torch.stack([key//c,key%c])
+
+
+def temporal_edges(groups,entities,times,m):
+    device=groups.device;order=(entities>=0).nonzero().flatten()
+    for key in (times,entities,groups):  # lexsort: seed subgraph, FK entity, time, row
+        order=order[torch.sort(key[order],stable=True).indices]
+    if not order.numel():return empty(device)
+    g,e,t=groups[order],entities[order],times[order];pos=torch.arange(len(order),device=device)
+    segment=torch.ones_like(pos,dtype=torch.bool);segment[1:]=(g[1:]!=g[:-1])|(e[1:]!=e[:-1])
+    run=segment.clone();run[1:]|=t[1:]!=t[:-1]
+    segment_start=pos[segment][segment.cumsum(0)-1];run_start=pos[run][run.cumsum(0)-1]
+    lo=torch.maximum(segment_start,run_start-m);count=run_start-lo  # rows strictly earlier in time
+    target=torch.repeat_interleave(pos,count)
+    source=lo[target]+torch.arange(len(target),device=device)-torch.repeat_interleave(count.cumsum(0)-count,count)
+    return torch.stack([order[source],order[target]])
+
+
+@torch.no_grad()
+def build_templates(batch,features,templates,cfg,active=None):
+    base=batch.edge_index_dict
+    result={}
+    for i,t in enumerate(templates):
+        if active is not None and not active[i]:continue
+        if t.kind=='knn':
+            edges=similarity_edges(features[t.src],batch[t.src].batch,k=cfg.knn_k,
+                                   eligible=batch[t.src].available)
+        elif t.kind=='behavioral':
+            relation=t.route[0];ei=base.get(relation)
+            if ei is None or not ei.numel():continue
+            aggregate=torch.zeros_like(features[t.src]);counts=aggregate.new_zeros((len(aggregate),1))
+            aggregate.index_add_(0,ei[0],features[relation[2]][ei[1]])
+            counts.index_add_(0,ei[0],counts.new_ones((ei.size(1),1)))
+            aggregate=aggregate/counts.clamp_min(1)
+            edges=similarity_edges(aggregate,batch[t.src].batch,threshold=cfg.sim_threshold,
+                                   eligible=(counts[:,0]>0)&batch[t.src].available)
+        elif t.kind=='two_hop':
+            first,second=t.route
+            if first not in base or second not in base:continue
+            edges=compose_edges(base[first],base[second],
+                (len(features[first[0]]),len(features[first[2]]),len(features[second[2]])))
         else:
-            s = torch.sigmoid(self.logit / self.tau)
+            edges=temporal_edges(batch[t.src].batch,batch[t.src][t.route[0]],batch[t.src].time,cfg.recent_k)
+        if edges.numel():result[i]=edges
+    return result
 
-        y = s * (self.zeta - self.gamma) + self.gamma
-        return torch.clamp(y, 0.0, 1.0)
-    
-    def get_discrete_mask(self, threshold=0.5):
-        with torch.no_grad():
-            s = torch.sigmoid(self.logit / self.tau)
-            return (s > threshold).float()
-    
-    def get_active_count(self, threshold=0.5):
-        mask = self.get_discrete_mask(threshold)
-        return mask.sum().item()
 
-    def l0(self):
-        c = math.log((0.0 - self.gamma) / (self.zeta - 0.0) + self.eps)
-        t = self.logit - self.tau * c
-        return torch.sigmoid(t).sum()
-    
+class HardConcrete(nn.Module):
+    def __init__(self,n,init=2.,tau=2.):
+        super().__init__();self.logit=nn.Parameter(torch.full((n,),float(init)))
+        self.register_buffer('tau',torch.tensor(float(tau)))
+    def forward(self,threshold=.5):
+        if not self.training:return (self.logit.sigmoid()>threshold).to(self.logit.dtype)
+        u=torch.rand_like(self.logit).clamp(1e-6,1-1e-6)
+        return ((torch.sigmoid((u.log()-(-u).log1p()+self.logit)/self.tau)*1.2)-.1).clamp(0,1)
+    def l0(self):return torch.sigmoid(self.logit-self.tau*math.log(.1/1.1)).sum()
+
 
 class TypeVIB(nn.Module):
-    def __init__(self, in_dim, hid):
-        super().__init__()
-        self.mu = nn.Linear(in_dim, hid)
-        self.logvar = nn.Linear(in_dim, hid)
-        nn.init.zeros_(self.mu.weight); nn.init.zeros_(self.mu.bias)
-        nn.init.zeros_(self.logvar.weight); nn.init.constant_(self.logvar.bias, -2.0) 
-
-    def forward(self, x: torch.Tensor):
-        if x.numel() == 0:
-            z = x  
-            kl = torch.tensor(0.0, device=x.device, dtype=x.dtype)
-            return z, kl
-
-        amp_enabled = torch.is_autocast_enabled()
-        with torch.autocast(device_type=x.device.type if x.is_cuda else 'cpu', enabled=False):
-            x32 = x.float()
-            mu = self.mu(x32)
-            logv = self.logvar(x32)
-
-            logv = torch.clamp(logv, min=-10.0, max=10.0)  
-            std = torch.exp(0.5 * logv)
-            eps = torch.randn_like(std)
-            z32 = mu + eps * std
-
-            kl = 0.5 * torch.mean(torch.sum(torch.exp(logv) + mu * mu - 1.0 - logv, dim=-1))
-
-        z = z32.to(dtype=x.dtype)
-        kl = kl.to(dtype=x.dtype)
-        return z, kl
+    def __init__(self,channels):
+        super().__init__();self.mu=nn.Linear(channels,channels);self.logvar=nn.Linear(channels,channels)
+        nn.init.zeros_(self.logvar.weight);nn.init.constant_(self.logvar.bias,-2.)
+    def forward(self,x):
+        if not x.numel():return x,x.new_zeros(())
+        mu=self.mu(x);logv=self.logvar(x).clamp(-10,10)
+        z=mu+torch.randn_like(mu)*(logv*.5).exp() if self.training else mu
+        kl=.5*(logv.exp()+mu.square()-1-logv).sum(-1).mean()
+        return z,kl
 
 
-def build_knn_edges(x: Tensor, k: int) -> Tensor:
-    if x.size(0) == 0 or k <= 0:
-        return None
-    x = nn.functional.normalize(x, p=2, dim=-1)
-    sim = x @ x.t()                           # [N, N]
-    N = x.size(0)
-    topk = torch.topk(sim, k=min(k + 1, N), dim=-1).indices  # [N, k+1]
-    src = torch.arange(N, device=x.device).unsqueeze(-1).expand_as(topk)  # [N, k+1]
-    src = src.reshape(-1)
-    dst = topk.reshape(-1)
-    mask = (src != dst)
-    ei = torch.stack([src[mask], dst[mask]], dim=0)
-    return ei
+class StructuralOptimizer(nn.Module):
+    def __init__(self,data,stats,cfg,temporal_fields):
+        super().__init__();self.cfg=cfg;self.types=list(data.node_types);self.relations=list(data.edge_types)
+        self.encoder=HeteroEncoder(cfg.channels,{nt:data[nt].tf.col_names_dict for nt in self.types},stats)
+        self.temporal_encoder=HeteroTemporalEncoder([nt for nt in self.types if 'time' in data[nt]],cfg.channels)
+        self.column_gates=nn.ModuleDict({nt:HardConcrete(cfg.channels,cfg.hc_init_logit,cfg.hc_tau_start) for nt in self.types})
+        self.table_gates=nn.ModuleDict({nt:HardConcrete(1,cfg.hc_init_logit,cfg.hc_tau_start) for nt in self.types})
+        self.vib=nn.ModuleDict({nt:TypeVIB(cfg.channels) for nt in self.types}) if cfg.beta_vib>0 else None
+        self.templates=template_catalog(self.types,self.relations,temporal_fields,cfg.strategies)
+        self.structure_gate=HardConcrete(len(self.templates),cfg.hc_init_logit,cfg.hc_tau_start)
+        self.base_convs=nn.ModuleList([nn.ModuleList([SAGEConv((cfg.channels,cfg.channels),cfg.channels,aggr=cfg.aggr)
+            for _ in self.relations]) for _ in range(cfg.num_layers)])
+        self.template_convs=nn.ModuleList([nn.ModuleList([SAGEConv((cfg.channels,cfg.channels),cfg.channels,
+            aggr=cfg.aggr,root_weight=False,bias=False) for _ in self.templates]) for _ in range(cfg.num_layers)])
+        self.norms=nn.ModuleList([nn.ModuleDict({nt:LayerNorm(cfg.channels,mode='node') for nt in self.types}) for _ in range(cfg.num_layers)])
+        self.head=MLP(cfg.channels,out_channels=1,num_layers=1,norm='batch_norm')
+        self.last_edges={}
 
-def two_hop_shortcuts(e12: Tensor, e23: Tensor) -> Tensor:
-    if e12 is None or e23 is None or e12.numel() == 0 or e23.numel() == 0:
-        return None
-    a_of_b = {}
-    src, mid = e12[0].tolist(), e12[1].tolist()
-    for a, b in zip(src, mid):
-        a_of_b.setdefault(b, []).append(a)
-    mids, cands = e23[0].tolist(), e23[1].tolist()
-    A, C = [], []
-    for b, c in zip(mids, cands):
-        if b in a_of_b:
-            for a in a_of_b[b]:
-                A.append(a); C.append(c)
-    if len(A) == 0:
-        return None
-    return torch.tensor([A, C], dtype=torch.long, device=e12.device)
+    def anneal(self,epoch):
+        cfg=self.cfg;fraction=max(0.,(epoch-cfg.warmup_epochs)/max(1,cfg.epochs-cfg.warmup_epochs))
+        tau=cfg.hc_tau_start*(cfg.hc_tau_end/cfg.hc_tau_start)**fraction
+        for module in self.modules():
+            if isinstance(module,HardConcrete):module.tau.fill_(tau)
+
+    def forward(self,batch,entity):
+        cfg=self.cfg;seed_time=batch[entity].seed_time;initial={}
+        for nt in self.types:
+            store=batch[nt];mask=store.available
+            h0=self.head.lins[0].weight.new_zeros((len(mask),cfg.channels))
+            if bool(mask.any()):
+                h0[mask]=self.encoder.encoders[nt](store.tf[mask])
+            initial[nt]=h0
+        valid_times={nt:batch[nt].time[batch[nt].available] for nt in batch.time_dict}
+        valid_groups={nt:batch[nt].batch[batch[nt].available] for nt in valid_times}
+        for nt,relative in self.temporal_encoder(seed_time,valid_times,valid_groups).items():
+            initial[nt][batch[nt].available]=initial[nt][batch[nt].available]+relative
+        reg={key:seed_time.new_zeros((),dtype=torch.float) for key in ['l0_w','l0_g','l0_h','kl_vib']}
+        x={}
+        for nt,h0 in initial.items():
+            column=self.column_gates[nt](cfg.gate_threshold) if cfg.lambda_w>0 else h0.new_ones(cfg.channels)
+            table=self.table_gates[nt](cfg.gate_threshold) if cfg.lambda_g>0 else h0.new_ones(1)
+            filtered=h0*column*table
+            reg['l0_w']=reg['l0_w']+self.column_gates[nt].l0()
+            reg['l0_g']=reg['l0_g']+self.table_gates[nt].l0()
+            if self.vib is not None:
+                mask=batch[nt].available
+                valid,kl=self.vib[nt](filtered[mask])
+                x[nt]=torch.zeros_like(filtered)
+                x[nt][mask]=valid
+                reg['kl_vib']=reg['kl_vib']+kl
+            else:x[nt]=filtered
+        h=self.structure_gate(cfg.gate_threshold);reg['l0_h']=self.structure_gate.l0()
+        edges=build_templates(batch,initial,self.templates,cfg,None if self.training else h.detach().bool().cpu().tolist())
+        self.last_edges=edges
+        for layer in range(cfg.num_layers):
+            out={nt:torch.zeros_like(value) for nt,value in x.items()}
+            for relation,conv in zip(self.relations,self.base_convs[layer]):
+                if relation in batch.edge_index_dict:
+                    src,_,dst=relation;out[dst]=out[dst]+conv((x[src],x[dst]),batch[relation].edge_index)
+            for idx,ei in edges.items():
+                template=self.templates[idx]
+                out[template.dst]=out[template.dst]+h[idx]*self.template_convs[layer][idx]((x[template.src],x[template.dst]),ei)
+            x={nt:self.norms[layer][nt](value) for nt,value in out.items()}
+            if layer+1<cfg.num_layers:x={nt:value.relu() for nt,value in x.items()}
+        logits=self.head(x[entity][:seed_time.numel()]).flatten()
+        return logits,reg
+
+    def regularization(self,reg):
+        c=self.cfg
+        return c.lambda_w*reg['l0_w']+c.lambda_g*reg['l0_g']+c.lambda_h*reg['l0_h']+c.beta_vib*reg['kl_vib']
+
+    def template_manifest(self):return [asdict(t) for t in self.templates]
+
+    @torch.no_grad()
+    def gate_signature(self,threshold):
+        assert not self.training
+        return b''.join(m(threshold).cpu().numpy().tobytes() for m in self.modules() if isinstance(m,HardConcrete))
 
 
+class Model(StructuralOptimizer):
 
-
-
-class Model(torch.nn.Module):
-
-    def __init__(
-        self,
-        args,
-        data: HeteroData,
-        col_stats_dict: Dict[str, Dict[str, Dict[StatType, Any]]],
-        num_layers: int,
-        channels: int,
-        out_channels: int,
-        aggr: str,
-        norm: str,
-        # List of node types to add shallow embeddings to input
-        shallow_list: List[NodeType] = [],
-        # ID awareness
-        id_awareness: bool = False,
-    ):
-        super().__init__()
-
+    def __init__(self, args, data, col_stats_dict, num_layers=None, channels=None,
+                 out_channels=1, aggr=None, norm="batch_norm", shallow_list=None,
+                 id_awareness=False, *, temporal_fields=None, config=None):
+        from types import SimpleNamespace
+        if out_channels != 1 or norm != "batch_norm" or shallow_list or id_awareness:
+            raise ValueError("This version implements the validated binary-classification model without ID embeddings.")
+        values = dict(config) if config is not None else dict(vars(args))
+        if config is None:
+            aliases = {"2hop_shot": "two_hop", "2hop_agg": "behavioral", "recent_k": "temporal"}
+            strategies = values.get("struct_strategies", values.get("strategies", "all"))
+            values["strategies"] = ",".join(dict.fromkeys(aliases.get(item.strip(), item.strip()) for item in strategies.split(",")))
+            values.setdefault("gate_threshold", 0.5)
+            values.setdefault("sim_threshold", 0.5)
+        for name, value in [("num_layers", num_layers), ("channels", channels), ("aggr", aggr)]:
+            if value is not None:
+                values[name] = value
+        if temporal_fields is None:
+            temporal_fields = {}
+            for node_type in data.node_types:
+                fields = [key for key in data[node_type].keys() if key.startswith("temporal_entity_")]
+                if fields:
+                    temporal_fields[node_type] = sorted(fields, key=lambda key: int(key.rsplit("_", 1)[1]))
+            if values["strategies"] in {"all", "temporal"} or "temporal" in values["strategies"].split(","):
+                if any("time" in data[nt] for nt in data.node_types) and not temporal_fields:
+                    raise ValueError("Temporal FK identity is missing; prepare the graph through the supplied main.py.")
+        super().__init__(data, col_stats_dict, SimpleNamespace(**values), temporal_fields)
+        self.temporal_fields = temporal_fields
         self.args = args
-        self.data = data
-        self.channels = channels
-        self.node_types = data.node_types
-        self.edge_types = data.edge_types
-        self.threshold = 0.5 
-        
-        self.encoder = HeteroEncoder(
-            channels=channels,
-            node_to_col_names_dict={
-                node_type: data[node_type].tf.col_names_dict
-                for node_type in data.node_types
-            },
-            node_to_col_stats=col_stats_dict,
-        )
-        self.temporal_encoder = HeteroTemporalEncoder(
-            node_types=[
-                node_type for node_type in data.node_types if "time" in data[node_type]
-            ],
-            channels=channels,
-        )
-       
-        self.gnn = HeteroGraphSAGE(
-                node_types=data.node_types,
-                edge_types=data.edge_types,
-                channels=channels,
-                aggr=aggr,
-                num_layers=num_layers,
-            )
-        self.head = MLP(
-            channels,
-            out_channels=out_channels,
-            norm=norm,
-            num_layers=1,
-        )
-        self.embedding_dict = ModuleDict(
-            {
-                node: Embedding(data.num_nodes_dict[node], channels)
-                for node in shallow_list
-            }
-        )
 
-        self.id_awareness_emb = None
-        if id_awareness:
-            self.id_awareness_emb = torch.nn.Embedding(1, channels)
+    def forward(self, batch, entity_table, apply_pruning=None):
+        return super().forward(batch, entity_table)
 
-        self.enable_type_gate = bool(args.lambda_g > 0)
-        self.enable_col_gate  = bool(args.lambda_g > 0)
-        self.enable_struct    = bool(args.lambda_h > 0)
-        self.enable_vib       = bool(args.beta_vib > 0)
+    def update_anneal(self, epoch, epochs, warmup_epochs, tau_start, tau_end):
+        self.cfg.epochs = epochs
+        self.cfg.warmup_epochs = warmup_epochs
+        self.cfg.hc_tau_start = tau_start
+        self.cfg.hc_tau_end = tau_end
+        self.anneal(epoch)
 
-        if self.enable_type_gate:
-            self.type_gate = ModuleDict({
-                nt: L0Gate(1, init_logit=args.hc_init_logit, tau=args.hc_tau_start) for nt in self.node_types
-            })
-        else:
-            self.type_gate = None
 
-        if self.enable_col_gate:
-            self.col_gate = ModuleDict()
-            for nt in self.node_types:
-                d = 0
-                for _, cols in data[nt].tf.col_names_dict.items():
-                    d += len(cols)
-                self.col_gate[nt] = L0Gate(d, init_logit=args.hc_init_logit, tau=args.hc_tau_start)
-        else:
-            self.col_gate = None
-
-        if self.enable_vib:
-            self.vib = ModuleDict({nt: TypeVIB(in_dim=channels, hid=channels) for nt in self.node_types})
-        else:
-            self.vib = None
-
-        if self.enable_struct:
-            self.struct_templates: List[str] = []
-            for nt in self.node_types:
-                self.struct_templates.append(f"knn::{nt}")
-            for (A, r1, B) in self.edge_types:
-                for (B2, r2, C) in self.edge_types:
-                    if B2 == B:
-                        self.struct_templates.append(f"2hop::{A}->{B}->{C}")
-            self.h_gate = L0Gate(len(self.struct_templates), init_logit=args.hc_init_logit, tau=args.hc_tau_start)
-        else:
-            self.struct_templates = []
-            self.h_gate = None
-
-        self.reset_parameters()
-
-    def reset_parameters(self):
-        self.encoder.reset_parameters()
-        self.temporal_encoder.reset_parameters()
-        self.gnn.reset_parameters()
-        self.head.reset_parameters()
-        for embedding in self.embedding_dict.values():
-            nn.init.normal_(embedding.weight, std=0.1)
-        if self.id_awareness_emb is not None:
-            self.id_awareness_emb.reset_parameters()
-    
-    def get_pruning_stats(self, threshold=0.5):
-        stats = {
-            "table_decisions": {},
-            "col_decisions": {},
-            "struct_decisions": None
-        }
-        
-        if self.enable_type_gate:
-            for nt, gate in self.type_gate.items():
-                mask = gate.get_discrete_mask(threshold)
-                stats["table_decisions"][nt] = mask.item() > 0.5
-        
-        if self.enable_col_gate:
-            for nt, gate in self.col_gate.items():
-                mask = gate.get_discrete_mask(threshold)
-                active = mask.sum().item()
-                total = mask.numel()
-                stats["col_decisions"][nt] = {
-                    "active": active,
-                    "total": total,
-                    "ratio": active / total if total > 0 else 0.0
-                }
-        
-        if self.enable_struct:
-            mask = self.h_gate.get_discrete_mask(threshold)
-            stats["struct_decisions"] = {
-                "active": mask.sum().item(),
-                "total": mask.numel()
-            }
-        
-        return stats
-    
-    def create_pruned_batch(self, original_batch: HeteroData, threshold=0.5) -> HeteroData:
- 
-        
-        pruned_batch = deepcopy(original_batch)
-
-        stats = self.get_pruning_stats(threshold)
-
-        if self.enable_type_gate:
-            for node_type, keep in stats["table_decisions"].items():
-                if not keep:
-                    
-                    if node_type in pruned_batch.node_types:
-                        
-                        if hasattr(pruned_batch[node_type], 'x'):
-                            delattr(pruned_batch[node_type], 'x')
-                        
-                        pruned_batch.node_types = [nt for nt in pruned_batch.node_types if nt != node_type]
-                                   
-                        edges_to_remove = []
-                        for edge_type in list(pruned_batch.edge_types):
-                            src, rel, dst = edge_type
-                            if src == node_type or dst == node_type:
-                                edges_to_remove.append(edge_type)
-                        
-                        for edge_type in edges_to_remove:
-                            del pruned_batch[edge_type]
-        
-        if self.enable_col_gate:
-            for node_type, col_info in stats["col_decisions"].items():
-                if node_type not in pruned_batch.node_types:
-                    continue
-                    
-                if hasattr(pruned_batch[node_type], 'x'):
-                    original_x = pruned_batch[node_type].x
-                    if col_info["active"] > 0:
-                        
-                        pass
-
-        if self.enable_struct and stats["struct_decisions"]:
-            h_mask = self.h_gate.get_discrete_mask(threshold)
-            activated_templates = []
-            for idx, name in enumerate(self.struct_templates):
-                if h_mask[idx].item() > 0.5:
-                    activated_templates.append(name)
-
-            for node_type in self.node_types:
-                if node_type not in pruned_batch.node_types:
-                    continue
-                    
-                knn_key = (node_type, f"knn_{node_type}", node_type)
-                if knn_key in pruned_batch.edge_index_dict:
-                    if f"knn::{node_type}" not in activated_templates:
-                        del pruned_batch[knn_key]
-            
-            for (A, r1, B) in self.edge_types:
-                for (B2, r2, C) in self.edge_types:
-                    if B2 == B:
-                        key = (A, f"2hop_{A}_{B}_{C}", C)
-                        template_name = f"2hop::{A}->{B}->{C}"
-                        if key in pruned_batch.edge_index_dict and template_name not in activated_templates:
-                            del pruned_batch[key]
-        
-        return pruned_batch
-    
-
-    def forward(
-        self,
-        batch: HeteroData,
-        entity_table: NodeType,
-        apply_pruning: bool = False,
-    ) -> Tensor:
-       
-        seed_time = batch[entity_table].seed_time
-        device = seed_time.device
-
-        if apply_pruning and not self.training:
-    
-            batch = self.create_pruned_batch(batch, self.threshold)
-
-            x_dict = self.encoder(batch.tf_dict)
-
-            rel_time_dict = self.temporal_encoder(
-                seed_time, batch.time_dict, batch.batch_dict
-            )
-            for node_type, rel_time in rel_time_dict.items():
-                x_dict[node_type] = x_dict[node_type] + rel_time
-
-            for node_type, embedding in self.embedding_dict.items():
-                x_dict[node_type] = x_dict[node_type] + embedding(batch[node_type].n_id)
-
-            edge_index_dict = dict(batch.edge_index_dict)  
-
-            if self.enable_struct and len(self.struct_templates) > 0:
-                h_mask = self.h_gate.get_discrete_mask(self.threshold)  # [num_templates]
-
-                for idx, name in enumerate(self.struct_templates):
-                    if h_mask[idx].item() <= 0.5:
-                        continue
-
-                    if name.startswith("knn::"):
-                        nt = name.split("::", 1)[1]
-                        if nt in x_dict and nt in batch.node_types:
-                            ei = build_knn_edges(x_dict[nt], k=self.args.knn_k)
-                            if ei is not None:
-                                key = (nt, "knn_" + nt, nt)
-                                edge_index_dict[key] = ei.to(device)
-
-                    elif name.startswith("2hop::"):
-                        trip = name[len("2hop::"):]
-                        A, rest = trip.split("->", 1)
-                        B, C = rest.split("->", 1)
-
-                        e12, e23 = None, None
-                        for (s, r, t), ei in batch.edge_index_dict.items():
-                            if s == A and t == B:
-                                e12 = ei
-                            if s == B and t == C:
-                                e23 = ei
-                        sc = two_hop_shortcuts(e12, e23)
-                        if sc is not None:
-                            key = (A, f"2hop_{A}_{B}_{C}", C)
-                            edge_index_dict[key] = sc.to(device)
-
-            x_dict = self.gnn(
-                x_dict,
-                edge_index_dict,
-                batch.num_sampled_nodes_dict,
-                batch.num_sampled_edges_dict,
-            )
-            logits = self.head(x_dict[entity_table][: seed_time.size(0)])
-
-            zero = torch.tensor(0.0, device=device)
-            reg_terms = {
-                "kl_vib": zero,
-                "l0_g":   zero,
-                "l0_w":   zero,
-                "l0_h":   zero,
-                "h_activated": zero,
-            }
-            return logits, reg_terms
-
-        x_dict = self.encoder(batch.tf_dict)  # get the original features based on raw datas
-
-        # get time feature based on timestamp
-        rel_time_dict = self.temporal_encoder(
-            seed_time, batch.time_dict, batch.batch_dict
-        )
-
-        for node_type, rel_time in rel_time_dict.items():
-            x_dict[node_type] = x_dict[node_type] + rel_time
-
-        for node_type, embedding in self.embedding_dict.items():
-            x_dict[node_type] = x_dict[node_type] + embedding(batch[node_type].n_id)
-
-        reg_terms = {
-            "kl_vib": torch.tensor(0.0, device=seed_time.device),
-            "l0_g":   torch.tensor(0.0, device=seed_time.device),
-            "l0_w":   torch.tensor(0.0, device=seed_time.device),
-            "l0_h":   torch.tensor(0.0, device=seed_time.device),
-            "h_activated": torch.tensor(0.0, device=seed_time.device),
-        }
-
-        if self.enable_col_gate:
-            for nt, x in x_dict.items():
-                g = self.col_gate[nt]()  # [num_cols] in [0,1]
-                repeat = math.ceil(self.channels / g.numel())
-                mask = g.repeat_interleave(1).repeat(repeat)[: self.channels]  # [C]
-                x_dict[nt] = x * mask
-                reg_terms["l0_w"] = reg_terms["l0_w"] + self.col_gate[nt].l0()
-
-        if self.enable_type_gate:
-            for nt, x in x_dict.items():
-                g = self.type_gate[nt]() 
-                x_dict[nt] = x * g
-                reg_terms["l0_g"] = reg_terms["l0_g"] + self.type_gate[nt].l0()
-
-
-        if self.enable_vib:
-            kl_sum = torch.tensor(0.0, device=seed_time.device, dtype=x_dict[next(iter(x_dict))].dtype)
-            for nt, x in x_dict.items():
-                if x.numel() == 0:
-                    continue
-                z, kl = self.vib[nt](x)
-                x_dict[nt] = z
-                kl_sum = kl_sum + kl
-            reg_terms["kl_vib"] = kl_sum
-
-
-        edge_index_dict = dict(batch.edge_index_dict)  
-
-        if self.enable_struct and len(self.struct_templates) > 0:
-            h = self.h_gate()   # [num_templates] \in [0,1]
-            reg_terms["l0_h"] = self.h_gate.l0()
-            reg_terms["h_activated"] = h.sum()
-
-            for idx, name in enumerate(self.struct_templates):
-                if float(h[idx].item()) <= 0.0:
-                    continue
-                if name.startswith("knn::"):
-                    nt = name.split("::", 1)[1]
-                    if nt in x_dict:
-                        ei = build_knn_edges(x_dict[nt], k=self.args.knn_k)
-                        if ei is not None:
-                            key = (nt, "knn_" + nt, nt)
-                            edge_index_dict[key] = ei.to(x_dict[nt].device)
-                elif name.startswith("2hop::"):
-                    trip = name[len("2hop::"):]
-                    A, rest = trip.split("->", 1)
-                    B, C = rest.split("->", 1)
-                    e12, e23 = None, None
-                    for (s, r, t), ei in batch.edge_index_dict.items():
-                        if s == A and t == B:
-                            e12 = ei
-                        if s == B and t == C:
-                            e23 = ei
-                    sc = two_hop_shortcuts(e12, e23)
-                    if sc is not None:
-                        key = (A, f"2hop_{A}_{B}_{C}", C)
-                        edge_index_dict[key] = sc.to(seed_time.device)
-
-
-        x_dict = self.gnn(
-            x_dict,
-            edge_index_dict,
-            batch.num_sampled_nodes_dict,
-            batch.num_sampled_edges_dict,
-        )
-        logits = self.head(x_dict[entity_table][: seed_time.size(0)])
-
-        return logits, reg_terms
-
-    
-
-    def forward_dst_readout(
-        self,
-        batch: HeteroData,
-        entity_table: NodeType,
-        dst_table: NodeType,
-    ) -> Tensor:
-        if self.id_awareness_emb is None:
-            raise RuntimeError(
-                "id_awareness must be set True to use forward_dst_readout"
-            )
-        seed_time = batch[entity_table].seed_time
-        x_dict = self.encoder(batch.tf_dict)
-        # Add ID-awareness to the root node
-        x_dict[entity_table][: seed_time.size(0)] += self.id_awareness_emb.weight
-
-        rel_time_dict = self.temporal_encoder(
-            seed_time, batch.time_dict, batch.batch_dict
-        )
-
-        for node_type, rel_time in rel_time_dict.items():
-            x_dict[node_type] = x_dict[node_type] + rel_time
-
-        for node_type, embedding in self.embedding_dict.items():
-            x_dict[node_type] = x_dict[node_type] + embedding(batch[node_type].n_id)
-
-        x_dict = self.gnn(
-            x_dict,
-            batch.edge_index_dict,
-        )
-
-        return self.head(x_dict[dst_table])
-    
-
-
-class RelGNN_Model(torch.nn.Module):
-
-    def __init__(
-        self,
-        data: HeteroData,
-        col_stats_dict: Dict[str, Dict[str, Dict[StatType, Any]]],
-        num_model_layers: int,
-        channels: int,
-        out_channels: int,
-        aggr: str,
-        norm: str,
-        # List of node types to add shallow embeddings to input
-        shallow_list: List[NodeType] = [],
-        # ID awareness
-        id_awareness: bool = False,
-        atomic_routes=None,
-        num_heads=None,
-        simplified_MP=False,
-    ):
-        super().__init__()
-
-        self.encoder = HeteroEncoder(
-            channels=channels,
-            node_to_col_names_dict={
-                node_type: data[node_type].tf.col_names_dict
-                for node_type in data.node_types
-            },
-            node_to_col_stats=col_stats_dict,
-        )
-        self.temporal_encoder = HeteroTemporalEncoder(
-            node_types=[
-                node_type for node_type in data.node_types if "time" in data[node_type]
-            ],
-            channels=channels,
-        )
-        self.gnn = RelGNN(
-            node_types=data.node_types,
-            edge_types=atomic_routes,
-            channels=channels,
-            aggr=aggr,
-            num_model_layers=num_model_layers,
-            num_heads=num_heads,
-            simplified_MP=simplified_MP,
-        )
-        self.head = MLP(
-            channels,
-            out_channels=out_channels,
-            norm=norm,
-            num_layers=1,
-        )
-        self.embedding_dict = ModuleDict(
-            {
-                node: Embedding(data.num_nodes_dict[node], channels)
-                for node in shallow_list
-            }
-        )
-
-        self.id_awareness_emb = None
-        if id_awareness:
-            self.id_awareness_emb = torch.nn.Embedding(1, channels)
-        self.reset_parameters()
-
-    def reset_parameters(self):
-        self.encoder.reset_parameters()
-        self.temporal_encoder.reset_parameters()
-        self.gnn.reset_parameters()
-        self.head.reset_parameters()
-        for embedding in self.embedding_dict.values():
-            torch.nn.init.normal_(embedding.weight, std=0.1)
-        if self.id_awareness_emb is not None:
-            self.id_awareness_emb.reset_parameters()
-
-    def forward(
-        self,
-        batch: HeteroData,
-        entity_table: NodeType,
-    ) -> Tensor:
-        seed_time = batch[entity_table].seed_time
-        x_dict = self.encoder(batch.tf_dict)
-
-        rel_time_dict = self.temporal_encoder(
-            seed_time, batch.time_dict, batch.batch_dict
-        )
-
-        for node_type, rel_time in rel_time_dict.items():
-            x_dict[node_type] = x_dict[node_type] + rel_time
-
-        for node_type, embedding in self.embedding_dict.items():
-            x_dict[node_type] = x_dict[node_type] + embedding(batch[node_type].n_id)
-
-        x_dict = self.gnn(
-            x_dict,
-            batch.edge_index_dict,
-        )
-
-        return self.head(x_dict[entity_table][: seed_time.size(0)])
-
-    def forward_dst_readout(
-        self,
-        batch: HeteroData,
-        entity_table: NodeType,
-        dst_table: NodeType,
-    ) -> Tensor:
-        if self.id_awareness_emb is None:
-            raise RuntimeError(
-                "id_awareness must be set True to use forward_dst_readout"
-            )
-        seed_time = batch[entity_table].seed_time
-        x_dict = self.encoder(batch.tf_dict)
-        # Add ID-awareness to the root node
-        x_dict[entity_table][: seed_time.size(0)] += self.id_awareness_emb.weight
-
-        rel_time_dict = self.temporal_encoder(
-            seed_time, batch.time_dict, batch.batch_dict
-        )
-
-        for node_type, rel_time in rel_time_dict.items():
-            x_dict[node_type] = x_dict[node_type] + rel_time
-
-        for node_type, embedding in self.embedding_dict.items():
-            x_dict[node_type] = x_dict[node_type] + embedding(batch[node_type].n_id)
-
-        x_dict = self.gnn(
-            x_dict,
-            batch.edge_index_dict,
-        )
-
-        return self.head(x_dict[dst_table])
-
-
-
-
-class StructuralInjectionManager(nn.Module):
-    
-    def __init__(self, channels, node_types, base_edge_types, args):
-        super().__init__()
-        self.channels = channels
-        self.node_types = node_types
-        self.base_edge_types = base_edge_types
-        self.args = args
-        
-        self.available_strategies = {
-            'knn': self._build_knn_templates,
-            'two_hop': self._build_two_hop_templates, 
-            'behavioral': self._build_behavioral_templates,
-            'temporal': self._build_temporal_templates
-        }
-        
-        self.active_strategies = self._parse_strategy_config(args.struct_strategies)
-        
-        self._init_templates_and_gates()
-    
-    def _parse_strategy_config(self, strategy_config):
-        if strategy_config is None or strategy_config == "none":
-            return []
-        elif strategy_config == "all":
-            return list(self.available_strategies.keys())
-        elif isinstance(strategy_config, str):
-            return [s.strip() for s in strategy_config.split(',')]
-        elif isinstance(strategy_config, list):
-            return strategy_config
-        else:
-            return []
-    
-    def _init_templates_and_gates(self):
-        self.templates = []
-        self.aug_edge_types = []
-        
-        for strategy in self.active_strategies:
-            if strategy in self.available_strategies:
-                template_builder = self.available_strategies[strategy]
-                template_builder()
-        
-        if self.templates:
-            self.template_gates = L0Gate(
-                len(self.templates),
-                init_logit=self.args.hc_init_logit,
-                tau=self.args.hc_tau_start
-            )
-        else:
-            self.template_gates = None
-    
-    def _build_knn_templates(self):
-        for node_type in self.node_types:
-            template_name = f"knn::{node_type}"
-            self.templates.append({
-                'name': template_name,
-                'type': 'knn',
-                'node_type': node_type,
-                'k': getattr(self.args, 'knn_k', 5)
-            })
-            self.aug_edge_types.append((node_type, f"knn_{node_type}", node_type))
-    
-    def _build_two_hop_templates(self):
-        for (A, r1, B) in self.base_edge_types:
-            for (B2, r2, C) in self.base_edge_types:
-                if B2 == B:
-                    template_name = f"2hop::{A}->{B}->{C}"
-                    self.templates.append({
-                        'name': template_name,
-                        'type': '2hop',
-                        'path': [A, B, C],
-                        'relations': [r1, r2]
-                    })
-                    self.aug_edge_types.append((A, f"2hop_{A}_{B}_{C}", C))
-    
-    def _build_behavioral_templates(self):
-        for src_type in self.node_types:
-            outgoing_edges = [et for et in self.base_edge_types if et[0] == src_type]
-            if outgoing_edges:
-                template_name = f"behavioral::{src_type}"
-                self.templates.append({
-                    'name': template_name,
-                    'type': 'behavioral',
-                    'src_type': src_type
-                })
-                self.aug_edge_types.append((src_type, f"behavioral_{src_type}", src_type))
-    
-    def _build_temporal_templates(self):
-        temporal_nodes = [nt for nt in self.node_types if hasattr(self.args, 'temporal_nodes') and nt in self.args.temporal_nodes]
-        for node_type in temporal_nodes:
-            template_name = f"temporal::{node_type}"
-            self.templates.append({
-                'name': template_name,
-                'type': 'temporal',
-                'node_type': node_type,
-                'k': getattr(self.args, 'recent_k', 3)
-            })
-            self.aug_edge_types.append((node_type, f"temporal_{node_type}", node_type))
-    
-    def forward(self, x_dict, batch, training=True):
-        if not self.templates or self.template_gates is None:
-            return {}, {}, 0.0
-        
-        sample_device = next(iter(x_dict.values())).device
-        gate_values = self.template_gates().to(sample_device) 
-        selected_edges = {}
-        edge_weights = {}
-        
-        for idx, template in enumerate(self.templates):
-            gate_val = gate_values[idx]
-            
-            threshold = 1e-3 if training else 0.5
-            if gate_val <= threshold:
-                continue
-                
-            edges = self._generate_edges_for_template(template, x_dict, batch)
-            if edges is not None and edges.size(1) > 0:
-                edge_key = self._get_edge_key_for_template(template)
-                selected_edges[edge_key] = edges
-                
-                edge_weights[edge_key] = gate_val * torch.ones(
-                    edges.size(1), device=edges.device 
-                )
-        
-        l0_penalty = self.template_gates.l0() if self.template_gates else 0.0
-        
-        return selected_edges, edge_weights, l0_penalty
-
-    
-    def _generate_edges_for_template(self, template, x_dict, batch):
-        template_type = template['type']
-        
-        if template_type == 'knn':
-            return self._generate_knn_edges(template, x_dict)
-        elif template_type == '2hop':
-            return self._generate_two_hop_edges(template, batch)
-        elif template_type == 'behavioral':
-            return self._generate_behavioral_edges(template, x_dict, batch)
-        elif template_type == 'temporal':
-            return self._generate_temporal_edges(template, x_dict, batch)
-        else:
-            return None
-    
-    def _generate_knn_edges(self, template, x_dict):
-        node_type = template['node_type']
-        k = template['k']
-        
-        if node_type not in x_dict:
-            return None
-            
-        features = x_dict[node_type]
-        if features.size(0) < 2:
-            return None
-        
-        n_nodes = features.size(0)
-        device = features.device
-        src = torch.arange(n_nodes, device=device).repeat_interleave(k)
-        offsets = torch.arange(1, k+1, device=device).repeat(n_nodes)
-        dst = (src + offsets) % n_nodes
-        
-        return torch.stack([src, dst])
-    
-    
-    def _generate_two_hop_edges(self, template, batch):
-        A, B, C = template['path']
-        
-        e12, e23 = None, None
-        for edge_type, edges in batch.edge_index_dict.items():
-            if edge_type[0] == A and edge_type[2] == B:
-                e12 = edges
-            elif edge_type[0] == B and edge_type[2] == C:
-                e23 = edges
-        
-        if e12 is None or e23 is None:
-            return None
-        
-        return two_hop_shortcuts(e12, e23)
-    
-    def _generate_behavioral_edges(self, template, x_dict, batch):
-        src_type = template['src_type']
-        
-        if src_type not in x_dict:
-            return None
-            
-        features = x_dict[src_type]
-        if features.size(0) < 2:
-            return None
-        
-        device = features.device
-        n_nodes = features.size(0)
-        src = torch.arange(n_nodes, device=device)
-        dst = torch.randperm(n_nodes, device=device) 
-        
-        return torch.stack([src, dst])
-    
-    def _generate_temporal_edges(self, template, x_dict, batch):
-        """生成时间连续性边"""
-        node_type = template['node_type']
-        k = template['k']
-
-        if node_type not in x_dict:
-            return None
-
-        n_nodes = x_dict[node_type].size(0)
-        if n_nodes < 2:
-            return None
-
-        device = x_dict[node_type].device
-
-        src_list, dst_list = [], []
-
-        # 按entity分组，组内按时间排序后连接
-        if hasattr(batch[node_type], 'batch') and hasattr(batch, 'time_dict') and node_type in batch.time_dict:
-            entity_ids = batch[node_type].batch          # 每个节点属于哪个seed entity
-            timestamps = batch.time_dict[node_type]      # 每个节点的时间戳
-
-            for eid in entity_ids.unique():
-                mask = (entity_ids == eid).nonzero(as_tuple=True)[0]
-                if mask.size(0) < 2:
-                    continue
-                # 按时间排序
-                order = timestamps[mask].argsort()
-                sorted_idx = mask[order]
-                src_list.append(sorted_idx[:-1])
-                dst_list.append(sorted_idx[1:])
-
-        # fallback：如果batch信息不可用，退回简化版
-        if len(src_list) == 0:
-            src = torch.arange(n_nodes - 1, device=device)
-            dst = torch.arange(1, n_nodes, device=device)
-            return torch.stack([src, dst])
-
-        src = torch.cat(src_list).to(device)
-        dst = torch.cat(dst_list).to(device)
-        return torch.stack([src, dst])
-    
-    def _get_edge_key_for_template(self, template):
-        template_type = template['type']
-        
-        if template_type == 'knn':
-            node_type = template['node_type']
-            return (node_type, f"knn_{node_type}", node_type)
-        elif template_type == '2hop':
-            A, B, C = template['path']
-            return (A, f"2hop_{A}_{B}_{C}", C)
-        elif template_type == 'behavioral':
-            src_type = template['src_type']
-            return (src_type, f"behavioral_{src_type}", src_type)
-        elif template_type == 'temporal':
-            node_type = template['node_type']
-            return (node_type, f"temporal_{node_type}", node_type)
-        
-        return None
-    
-    def get_augmented_edge_types(self):
-        return self.aug_edge_types
