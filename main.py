@@ -31,9 +31,7 @@ def parser():
     parser.add_argument('--text_revision', default=TEXT_REVISION)
     parser.add_argument('--config', type=Path, help='JSON containing only the model/training configuration')
     parser.add_argument('--trial_id', default=None)
-    parser.add_argument('--gate_thresholds', type=float, nargs='+')
     parser.add_argument('--dry_run', action='store_true')
-    # Keep explicit argparse parameters, as in Structural_optimizer_RDL/main.py.
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--epochs', type=int, default=50)
     parser.add_argument('--batch_size', type=int, default=256)
@@ -77,8 +75,6 @@ def parse(argv=None):
             p.error(key + ' must be positive')
     if args.max_steps_per_epoch < 0 or args.warmup_epochs < 0:
         p.error('Step limit and warmup must be nonnegative')
-    if not args.gate_thresholds or any(not 0 <= t <= 1 for t in args.gate_thresholds):
-        p.error('Gate thresholds must be in [0,1]')
     return args, config
 
 
@@ -86,7 +82,7 @@ def main():
     args, config = parse()
     if args.dry_run:
         print(json.dumps(dict(mode=args.mode, dataset=args.dataset, task=args.task,
-                              config=config, thresholds=args.gate_thresholds,
+                              config=config,
                               selection='validation AUROC only', test_labels_loaded=False), indent=2))
         return
     env = dict(PYTHONHASHSEED=str(args.seed), CUBLAS_WORKSPACE_CONFIG=':4096:8',
