@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from common import DATA_REVISION, OFFICIAL_COMMIT, lock, reseed, sha256, source_hash, task_id, write_json
 from data_pipeline import download, load_task, make_loader, read_graph
 
+GATE_THRESHOLDS = [.5, .7, .78, .82, .86, .9]
 
 def locations(args):
     name = task_id(args.dataset, args.task)
@@ -68,7 +69,7 @@ def train(args, config):
     tables = {s: task.get_table(s).df for s in ('train', 'val')}
     cfg = SimpleNamespace(**config)
     device = torch.device('cpu' if args.gpu == 'cpu' else 'cuda:0')
-    thresholds = sorted(set(args.gate_thresholds))
+    thresholds = thresholds = sorted(set(GATE_THRESHOLDS))
     trial = args.trial_id or hashlib.sha256(json.dumps([config, thresholds], sort_keys=True).encode()).hexdigest()[:16]
     rows_path = Path(args.output_root) / 'results' / (name + '_all_results.jsonl')
     identity = dict(source_hash=source_hash(), graph_sha256=graph_meta['graph_sha256'])
