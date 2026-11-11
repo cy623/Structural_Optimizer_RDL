@@ -1,0 +1,604 @@
+r"""Manifest-driven, Hugging Face-backed loader for RelBench datasets and tasks.
+
+This is the whole consumption path: no per-dataset or per-task classes. A dataset is a
+folder of plain parquet + a ``manifest.yaml``; a task is a subdirectory with its own
+``manifest.yaml`` (and, for ``kind="forecast"`` tasks, the duckdb query that regenerates its
+labels). Adding a task later is just adding a directory.
+
+Public API::
+
+    ds   = relbench.load_dataset("stanford-star/relbench-v1/rel-f1")   # Hub 'org/repo[/subdir]' or a local path
+    task = ds.load_task("driver-position")                 # ds.get_task_names() lists them
+    db   = ds.get_db()
+    train = task.get_table("train")
+    task.evaluate(pred)
+
+The generic ``Task`` is built by parametrizing the existing
+``EntityTask`` / ``RecommendationTask`` / ``AutoCompleteTask`` scaffolding with the
+manifest -- so split logic, dangling-entity filtering, masking, evaluation and metrics
+are exactly the shipped behavior; only ``make_table`` changes to run the manifest SQL.
+"""
+
+from __future__ import annotations
+
+import os
+from pathlib import Path
+from typing import Optional, Union
+
+import pandas as pd
+
+from relbench import hf, metrics
+from relbench.base import (
+    AutoCompleteTask,
+    Database,
+    Dataset,
+    EntityTask,
+    RecommendationTask,
+    Table,
+    TaskType,
+)
+from relbench.manifest import (
+    KIND_AUTOCOMPLETE,
+    KIND_EXTERNAL,
+    KIND_FORECAST,
+    DatasetManifest,
+    TaskManifest,
+)
+
+# The default metric per task type. RelBench provides evaluators for the three core task
+# types only (the user does not choose the metric); multiclass/multilabel tasks are
+# definable but carry no provided evaluator. Regression's NMAE is built per-task (it needs
+# the train-split target std), so it is handled specially in `_resolve_metrics`.
+DEFAULT_METRICS: dict[TaskType, list[str]] = {
+    TaskType.BINARY_CLASSIFICATION: ["roc_auc"],
+    TaskType.REGRESSION: ["nmae"],
+    TaskType.RECOMMENDATION: ["map"],
+}
+
+
+def train_std(task) -> float:
+    r"""Standard deviation (ddof=1) of a regression task's target on its train split.
+
+    This is the normalizer that turns MAE into NMAE. For the hosted stanford-star/relbench-v1 tasks the
+    same values are precomputed and stored at ``stanford-star/relbench-v1`` (see
+    :func:`relbench.hf.load_core_regression_stds`); this utility recomputes one from scratch.
+    """
+    df = task.get_table("train").df
+    return float(df[task.target_col].std(ddof=1))
+
+
+def _hosted_std(dataset_name: Optional[str], task_name: Optional[str]):
+    r"""The precomputed NMAE normalizer for a hosted task, or None.
+
+    Needs no task object, so it can be resolved before one exists -- and when it hits,
+    the train split is never read just to take a standard deviation.
+    """
+    if dataset_name is None or task_name is None:
+        return None
+    try:
+        stds = hf.load_core_regression_stds()
+    except Exception:
+        return None
+    std = stds.get(f"{dataset_name}/{task_name}")
+    return None if std is None else float(std)
+
+
+def _resolve_metrics(tm: TaskManifest, task=None) -> list:
+    # Metrics are not stored in the manifest; they default from the task type. RelBench
+    # provides evaluators for the core task types only; multiclass/multilabel tasks are
+    # loadable but carry no evaluator -- bring your own via task.evaluate(pred, metrics=).
+    task_type = TaskType(tm.task_type)
+    if task_type not in DEFAULT_METRICS:
+        return []
+    out = []
+    for name in DEFAULT_METRICS[task_type]:
+        if name == "nmae":
+            # `task` is still under construction here, so the std cannot be resolved
+            # yet; `build_task` sets `task.nmae_std` once the task is complete.
+            out.append(metrics.make_nmae(lambda: task.nmae_std))
+        else:
+            out.append(getattr(metrics, name))
+    return out
+
+
+def _hosted_name(dataset) -> Optional[str]:
+    r"""The dataset's name if it was resolved from the Hub, else ``None``.
+
+    Only Hub-resolved datasets -- addressed by a Hub spec, or by a directory inside the
+    Hub cache such as the one :func:`relbench.submit.evaluate_task` fetches -- consult
+    the Hub for tasks hosted apart from the database and for precomputed regression stds. A dataset loaded from a local path -- or a plain
+    in-memory :class:`~relbench.base.Dataset` such as the test fixtures -- stays local:
+    ``None`` makes the NMAE normalizer fall back to the train split and confines bare
+    task names to the dataset's own folder.
+    """
+    if getattr(dataset, "is_local", True):
+        return None
+    return dataset.manifest.name
+
+
+def _coerce_string_dtype(df: pd.DataFrame) -> pd.DataFrame:
+    # DuckDB cannot reliably ingest pandas StringDtype columns; match base.Table.load.
+    for col in df.columns:
+        if isinstance(df[col].dtype, pd.StringDtype):
+            df[col] = df[col].astype(object)
+    return df
+
+
+def _load_database(db_dir: Path, manifest: DatasetManifest) -> Database:
+    r"""Build a :class:`Database` from plain parquet + manifest relational metadata.
+
+    The parquet files carry no RelBench metadata; all keys/time columns come from the
+    manifest, which is the sole source of truth.
+    """
+    table_dict: dict[str, Table] = {}
+    for name, spec in manifest.tables.items():
+        df = _coerce_string_dtype(pd.read_parquet(db_dir / f"{name}.parquet"))
+        table_dict[name] = Table(
+            df=df,
+            fkey_col_to_pkey_table=dict(spec.fkeys),
+            pkey_col=spec.pkey,
+            time_col=spec.time_col,
+        )
+    return Database(table_dict)
+
+
+class RelBenchDataset(Dataset):
+    r"""A dataset loaded from a manifest + parquet folder.
+
+    Reads relational metadata from the manifest instead of parquet; hosted artifacts
+    already follow the key contract, so load is pure I/O.
+
+    Construction resolves the dataset directory and reads the manifest, so everything
+    but the data itself is a plain attribute -- nothing here is cached or lazy. The
+    database and the label tables are not touched.
+    """
+
+    def __init__(
+        self, name_or_path: Union[str, Path], *, revision: Optional[str] = None
+    ) -> None:
+        self.name_or_path = name_or_path
+        self.revision = revision
+        p = Path(name_or_path).expanduser()
+        self.is_local = (p / "manifest.yaml").exists() and not _in_hf_cache(p)
+        self.dataset_dir = _resolve_dataset_dir(name_or_path, revision)
+        self.db_dir = self.dataset_dir / "db"
+        self.manifest = DatasetManifest.load(self.dataset_dir / "manifest.yaml")
+        self.val_timestamp = pd.Timestamp(self.manifest.val_timestamp)
+        self.test_timestamp = pd.Timestamp(self.manifest.test_timestamp)
+
+    def __repr__(self) -> str:
+        return f"RelBenchDataset({str(self.name_or_path)!r})"
+
+    def get_task_names(self) -> list[str]:
+        r"""List tasks available for this dataset.
+
+        Local ``tasks/*/manifest.yaml`` directories, plus -- for a dataset resolved from
+        the Hub -- every task hosted for this dataset name in any RelBench repo. Tasks
+        can live apart from their database (the v2-only tasks on the v1 datasets), and a
+        name listed here is a name :meth:`load_task` accepts. A dataset loaded from a
+        local path lists only its own folder.
+        """
+        names = set()
+        tasks_dir = self.dataset_dir / "tasks"
+        if tasks_dir.exists():
+            names |= {
+                d.name for d in tasks_dir.iterdir() if (d / "manifest.yaml").exists()
+            }
+        name = _hosted_name(self)
+        if name is not None:
+            names |= set(hf.list_task_names(name, revision=self.revision))
+        return sorted(names)
+
+    def _resolve_task_dir(self, task_name: Union[str, Path]) -> Path:
+        r"""The directory holding ``task_name``'s manifest.
+
+        Accepts, in order: a local path to a task directory; a task of this dataset's own
+        folder; a Hub ``org/repo/<subdir>`` spec pointing at a task directory; and -- for
+        a dataset resolved from the Hub -- a bare task name hosted for this dataset in any
+        RelBench repo. A local dataset never consults the Hub for a bare name.
+        """
+        p = Path(task_name)
+        if (p / "manifest.yaml").exists():
+            return p
+        local = self.dataset_dir / "tasks" / str(task_name)
+        if (local / "manifest.yaml").exists():
+            return local
+        spec = str(task_name)
+        if "/" in spec:
+            return hf.download_dataset_dir(spec, revision=self.revision)
+        name = _hosted_name(self)
+        if name is not None:
+            found = hf.find_task_dir(name, spec, revision=self.revision)
+            if found is not None:
+                return found
+        where = (
+            f"no manifest at {local}"
+            if name is None
+            else f"no manifest at {local}, and no such task hosted in "
+            f"{', '.join(hf.RELBENCH_REPOS)}"
+        )
+        raise ValueError(
+            f"no task '{task_name}' for dataset {self.name_or_path!r}: {where}. "
+            f"Available: {', '.join(self.get_task_names()) or '(none)'}."
+        )
+
+    def load_task(self, task_name: Union[str, Path], *, regenerate: bool = False):
+        r"""Load a task against this dataset's database.
+
+        ``task_name`` is a bare task name (resolved in this dataset's folder, then across
+        the hosted RelBench repos), a Hub ``org/repo/<dataset>/tasks/<task>`` spec, or a
+        local task directory -- so a task built or hosted anywhere runs against this
+        database.
+
+        Uses hosted labels when present; ``regenerate=True`` recomputes them from the
+        database via the task manifest's SQL (the provenance check used in CI).
+        """
+        task_dir = self._resolve_task_dir(task_name)
+        tm = TaskManifest.load(task_dir / "manifest.yaml")
+        return build_task(self, tm, task_dir=task_dir, regenerate=regenerate)
+
+    def make_db(self) -> Database:
+        return _load_database(self.db_dir, self.manifest)
+
+    def get_db(self, upto_test_timestamp: bool = True) -> Database:
+        r"""Build the database.
+
+        Pure and uncached -- keep what you get back.
+        """
+        db = self.make_db()
+        if upto_test_timestamp:
+            db = db.upto(self.test_timestamp)
+        self.validate_and_correct_db(db)
+        return db
+
+
+def _parse_timedelta(value: Optional[str]) -> pd.Timedelta:
+    if value is None:
+        raise ValueError("task manifest is missing 'timedelta'")
+    return pd.Timedelta(value)
+
+
+def _run_task_sql(
+    sql: str,
+    db: Database,
+    timestamps: "pd.DatetimeIndex",
+    timedelta: pd.Timedelta,
+) -> pd.DataFrame:
+    r"""Run a task's manifest SQL.
+
+    Exposes a ``timestamps(timestamp)`` relation (the seed timestamps for the split) and
+    every db table as a view by name, and substitutes ``{timedelta}`` with the duckdb
+    INTERVAL string -- the same environment the legacy ``make_table`` queries assumed.
+    """
+    import duckdb  # lazy: keeps `import relbench` importable where duckdb isn't (e.g. Pyodide)
+
+    con = duckdb.connect()
+    try:
+        # A memory limit makes duckdb raise a catchable OOM (and spill to disk) rather
+        # than letting the OS kill the process on a runaway query. Opt-in via env.
+        limit = os.getenv("RELBENCH_DUCKDB_MEMORY_LIMIT")
+        if limit:
+            con.execute(f"SET memory_limit='{limit}'")
+        con.register("timestamps", pd.DataFrame({"timestamp": timestamps}))
+        for name, table in db.table_dict.items():
+            con.register(name, table.df)
+        return con.sql(sql.replace("{timedelta}", str(timedelta))).df()
+    finally:
+        con.close()
+
+
+class _HostedLabelsMixin:
+    r"""Use hosted plain-parquet labels when present, else regenerate from the database.
+
+    ``_get_table`` (regeneration via ``make_table``) and all masking/eval/filtering are
+    inherited unchanged from the base task class.
+    """
+
+    _task_dir: Optional[Path] = None
+    _regenerate: bool = False
+    name: Optional[str] = None
+    kind: Optional[str] = None
+
+    def __repr__(self) -> str:
+        return (
+            f"{type(self).__name__.lstrip('_')}({self.name!r}, "
+            f"dataset={self.dataset!r})"
+        )
+
+    def _label_fkeys(self) -> dict[str, str]:
+        if isinstance(self, RecommendationTask):
+            return {
+                self.src_entity_col: self.src_entity_table,
+                self.dst_entity_col: self.dst_entity_table,
+            }
+        return {self.entity_col: self.entity_table}
+
+    def get_table(
+        self,
+        split: str,
+        mask_input_cols: Optional[bool] = None,
+        db: Optional[Database] = None,
+    ) -> Table:
+        if mask_input_cols is None:
+            mask_input_cols = split == "test"
+
+        path = None
+        if self._task_dir is not None and not self._regenerate:
+            candidate = Path(self._task_dir) / f"{split}.parquet"
+            if candidate.exists():
+                path = candidate
+
+        if path is not None:
+            # Hosted labels are written in canonical order (see
+            # `relbench.base.task_base.sort_labels`); no re-sorting on read.
+            df = _coerce_string_dtype(pd.read_parquet(path))
+            table = Table(
+                df=df,
+                fkey_col_to_pkey_table=self._label_fkeys(),
+                pkey_col=None,
+                time_col=self.time_col,
+            )
+        else:
+            table = self._get_table(split, db)  # regenerate (already filters dangling)
+
+        if mask_input_cols:
+            table = self._mask_input_cols(table)
+        return table
+
+
+class _ForecastEntityTask(_HostedLabelsMixin, EntityTask):
+    def __init__(
+        self, dataset: Dataset, tm: TaskManifest, task_dir=None, regenerate=False
+    ):
+        self.name, self.kind = tm.name, tm.kind
+        self.task_type = TaskType(tm.task_type)
+        self.entity_table = tm.entity_table
+        self.entity_col = tm.entity_col
+        self.target_col = tm.target_col
+        self.time_col = tm.time_col
+        self.timedelta = _parse_timedelta(tm.timedelta)
+        self.num_eval_timestamps = tm.num_eval_timestamps
+        self.metrics = _resolve_metrics(tm, task=self)
+        self._sql = tm.sql
+        self._task_dir = Path(task_dir) if task_dir is not None else None
+        self._regenerate = regenerate
+        super().__init__(dataset, remove_columns=tm.remove_columns)
+
+    def make_table(self, db: Database, timestamps) -> Table:
+        df = _run_task_sql(self._sql, db, timestamps, self.timedelta)
+        return Table(
+            df=df,
+            fkey_col_to_pkey_table={self.entity_col: self.entity_table},
+            pkey_col=None,
+            time_col=self.time_col,
+        )
+
+
+class _ForecastRecommendationTask(_HostedLabelsMixin, RecommendationTask):
+    def __init__(
+        self, dataset: Dataset, tm: TaskManifest, task_dir=None, regenerate=False
+    ):
+        self.name, self.kind = tm.name, tm.kind
+        self.task_type = TaskType(tm.task_type)
+        self.src_entity_table = tm.src_entity_table
+        self.src_entity_col = tm.src_entity_col
+        self.dst_entity_table = tm.dst_entity_table
+        self.dst_entity_col = tm.dst_entity_col
+        self.target_col = tm.target_col
+        self.time_col = tm.time_col
+        self.timedelta = _parse_timedelta(tm.timedelta)
+        self.num_eval_timestamps = tm.num_eval_timestamps
+        self.eval_k = tm.eval_k
+        self.metrics = _resolve_metrics(tm, task=self)
+        self._sql = tm.sql
+        self._task_dir = Path(task_dir) if task_dir is not None else None
+        self._regenerate = regenerate
+        super().__init__(dataset, remove_columns=tm.remove_columns)
+
+    def make_table(self, db: Database, timestamps) -> Table:
+        df = _run_task_sql(self._sql, db, timestamps, self.timedelta)
+        return Table(
+            df=df,
+            fkey_col_to_pkey_table={
+                self.src_entity_col: self.src_entity_table,
+                self.dst_entity_col: self.dst_entity_table,
+            },
+            pkey_col=None,
+            time_col=self.time_col,
+        )
+
+
+class _AutoCompleteTask(_HostedLabelsMixin, AutoCompleteTask):
+    def __init__(
+        self, dataset: Dataset, tm: TaskManifest, task_dir=None, regenerate=False
+    ):
+        self.name, self.kind = tm.name, tm.kind
+        self._task_dir = Path(task_dir) if task_dir is not None else None
+        self._regenerate = regenerate
+        super().__init__(
+            dataset,
+            task_type=TaskType(tm.task_type),
+            entity_table=tm.entity_table,
+            target_col=tm.target_col,
+            remove_columns=tm.remove_columns,
+            nmae_std=_hosted_std(_hosted_name(dataset), tm.name),
+        )
+
+
+class _ExternalEvaluatorMixin:
+    r"""External tasks that declare a custom ``evaluator`` (TGB's negative-sampled MRR /
+    NDCG, 4DBInfer's candidate-ranking MRR) are served as data only: RelBench 3 does not
+    implement those protocols, so :meth:`evaluate` refuses unless explicit ``metrics``
+    are passed."""
+
+    evaluator: Optional[str] = None
+
+    def evaluate(self, pred, target_table=None, metrics=None):
+        if self.evaluator and metrics is None:
+            raise NotImplementedError(
+                f"task '{self.name}' is scored with the '{self.evaluator}' protocol, "
+                "which RelBench does not implement; its label tables are served as-is. "
+                "Use the upstream evaluator, or pass metrics=[...] for your own."
+            )
+        return super().evaluate(pred, target_table, metrics)
+
+
+class _ExternalEntityTask(_ExternalEvaluatorMixin, _HostedLabelsMixin, EntityTask):
+    r"""Entity task whose labels are built externally (e.g. dbinfer) and served as-
+    is."""
+
+    def __init__(
+        self, dataset: Dataset, tm: TaskManifest, task_dir=None, regenerate=False
+    ):
+        self.name, self.kind = tm.name, tm.kind
+        self.evaluator = tm.evaluator
+        self.task_type = TaskType(tm.task_type)
+        self.entity_table = tm.entity_table
+        self.entity_col = tm.entity_col
+        self.target_col = tm.target_col
+        self.time_col = tm.time_col
+        self.timedelta = (
+            _parse_timedelta(tm.timedelta) if tm.timedelta else pd.Timedelta(days=1)
+        )
+        self.num_eval_timestamps = tm.num_eval_timestamps
+        self.metrics = _resolve_metrics(tm, task=self)
+        if regenerate:
+            raise ValueError(
+                f"task '{tm.name}': external labels are hosted, not regenerable"
+            )
+        self._task_dir = Path(task_dir) if task_dir is not None else None
+        self._regenerate = False
+        super().__init__(dataset, remove_columns=tm.remove_columns)
+
+    def make_table(self, db: Database, timestamps) -> Table:
+        raise NotImplementedError("external task labels are hosted, not regenerable")
+
+
+class _ExternalRecommendationTask(
+    _ExternalEvaluatorMixin, _HostedLabelsMixin, RecommendationTask
+):
+    r"""Link task whose labels/eval are built externally (e.g. TGB) and served as-is."""
+
+    def __init__(
+        self, dataset: Dataset, tm: TaskManifest, task_dir=None, regenerate=False
+    ):
+        self.name, self.kind = tm.name, tm.kind
+        self.evaluator = tm.evaluator
+        self.task_type = TaskType(tm.task_type)
+        self.src_entity_table = tm.src_entity_table
+        self.src_entity_col = tm.src_entity_col
+        self.dst_entity_table = tm.dst_entity_table
+        self.dst_entity_col = tm.dst_entity_col
+        self.target_col = tm.target_col
+        self.time_col = tm.time_col
+        self.timedelta = (
+            _parse_timedelta(tm.timedelta) if tm.timedelta else pd.Timedelta(days=1)
+        )
+        self.num_eval_timestamps = tm.num_eval_timestamps
+        self.eval_k = tm.eval_k
+        self.metrics = _resolve_metrics(tm, task=self)
+        if regenerate:
+            raise ValueError(
+                f"task '{tm.name}': external labels are hosted, not regenerable"
+            )
+        self._task_dir = Path(task_dir) if task_dir is not None else None
+        self._regenerate = False
+        super().__init__(dataset, remove_columns=tm.remove_columns)
+
+    def make_table(self, db: Database, timestamps) -> Table:
+        raise NotImplementedError("external task labels are hosted, not regenerable")
+
+
+def _install_nmae_std(task, dataset: Dataset, tm: TaskManifest) -> None:
+    r"""Resolve the NMAE normalizer once, now that the task is fully built.
+
+    The hosted std if there is one, else the std of the train split. Stored on the task;
+    the metric just reads the attribute.
+    """
+    if TaskType(tm.task_type) != TaskType.REGRESSION:
+        return
+    std = _hosted_std(_hosted_name(dataset), tm.name)
+    task.nmae_std = train_std(task) if std is None else std
+
+
+def build_task(
+    dataset: Dataset,
+    tm: TaskManifest,
+    *,
+    task_dir: Optional[Path] = None,
+    regenerate: bool = False,
+):
+    r"""Instantiate the generic task object for a task manifest."""
+    tm.validate()
+    is_link = TaskType(tm.task_type) == TaskType.RECOMMENDATION
+    if tm.kind == KIND_AUTOCOMPLETE:
+        # AutoCompleteTask resolves its own std in __init__ (it needs the train split
+        # only when there is no hosted value).
+        task = _AutoCompleteTask(dataset, tm, task_dir=task_dir, regenerate=regenerate)
+    else:
+        if tm.kind == KIND_FORECAST:
+            cls = _ForecastRecommendationTask if is_link else _ForecastEntityTask
+        elif tm.kind == KIND_EXTERNAL:
+            cls = _ExternalRecommendationTask if is_link else _ExternalEntityTask
+        else:
+            raise ValueError(f"unknown task kind: {tm.kind!r}")
+        # `remove_columns` is not an autocomplete-only field: a forecast or external
+        # task whose label is derived from a database column has to hide that column
+        # too (dbinfer's `cvr` is `View.added_to_cart`, `charge` is `Dobito.sluzba`).
+        # Each task carries its own removals and applies them in `task.get_db()`, so
+        # tasks over one dataset stay independent.
+        task = cls(dataset, tm, task_dir=task_dir, regenerate=regenerate)
+        _install_nmae_std(task, dataset, tm)
+    return task
+
+
+# --------------------------------------------------------------------------- #
+# Public entry points
+# --------------------------------------------------------------------------- #
+
+
+def _hf_hub_cache() -> Path:
+    from huggingface_hub.constants import HF_HUB_CACHE
+
+    return Path(HF_HUB_CACHE)
+
+
+def _in_hf_cache(p: Path) -> bool:
+    try:
+        p.resolve().relative_to(_hf_hub_cache().resolve())
+    except ValueError:
+        return False
+    return True
+
+
+def _looks_like_path(name_or_path: Union[str, Path]) -> bool:
+    if isinstance(name_or_path, Path):
+        return True
+    s = str(name_or_path)
+    return os.path.isabs(s) or s.startswith((".", "~")) or os.path.exists(s)
+
+
+def _resolve_dataset_dir(
+    name_or_path: Union[str, Path], revision: Optional[str]
+) -> Path:
+    p = Path(name_or_path).expanduser()
+    if (p / "manifest.yaml").exists():
+        return p
+    if _looks_like_path(name_or_path):
+        raise FileNotFoundError(
+            f"{p} is not a RelBench dataset directory (no manifest.yaml found); "
+            "pass a directory holding manifest.yaml, or a Hub 'org/repo[/subdir]'."
+        )
+    return hf.download_dataset_dir(str(name_or_path), revision=revision)
+
+
+def load_dataset(
+    name_or_path: Union[str, Path], *, revision: Optional[str] = None
+) -> RelBenchDataset:
+    r"""Load a RelBench dataset from a Hub ``org/repo[/subdir]`` or a local path.
+
+    Resolves the directory (downloading it if needed) and reads the manifest; the
+    database is read on demand by ``get_db``. Tasks come from the returned object --
+    ``load_dataset(spec).load_task(name)`` / ``.get_task_names()``.
+    """
+    return RelBenchDataset(name_or_path, revision=revision)
