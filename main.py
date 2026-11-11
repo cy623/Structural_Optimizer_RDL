@@ -1,4 +1,3 @@
-"""Single-task entry point. HPO never reads or scores the test target."""
 import argparse
 import json
 import os
