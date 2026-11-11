@@ -1,0 +1,52 @@
+{
+  "tasks": [
+    {
+      "dataset": "rel-f1",
+      "task": "driver-top3"
+    },
+    {
+      "dataset": "rel-f1",
+      "task": "driver-dnf"
+    },
+    {
+      "dataset": "rel-event",
+      "task": "user-repeat"
+    },
+    {
+      "dataset": "rel-event",
+      "task": "user-ignore"
+    },
+    {
+      "dataset": "rel-trial",
+      "task": "study-outcome"
+    },
+    {
+      "dataset": "rel-avito",
+      "task": "user-visits"
+    },
+    {
+      "dataset": "rel-avito",
+      "task": "user-clicks"
+    },
+    {
+      "dataset": "rel-stack",
+      "task": "user-engagement"
+    },
+    {
+      "dataset": "rel-stack",
+      "task": "user-badge"
+    },
+    {
+      "dataset": "rel-hm",
+      "task": "user-churn"
+    },
+    {
+      "dataset": "rel-amazon",
+      "task": "item-churn"
+    },
+    {
+      "dataset": "rel-amazon",
+      "task": "user-churn"
+    }
+  ]
+}
